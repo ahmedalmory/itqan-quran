@@ -1,0 +1,29 @@
+# Environment files
+.env
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+
+# Dependency directories
+vendor/
+node_modules/
+
+# Local development files
+*.local
+*.dev
+
+# Cache
+cache/
+tmp/
+
+database/schema.sql

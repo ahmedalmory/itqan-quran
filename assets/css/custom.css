@@ -1,0 +1,77 @@
+/* Custom styles for AlQuran System */
+
+/* Hero section */
+.bg-primary {
+    background: linear-gradient(135deg, #1e88e5 0%, #1565c0 100%) !important;
+}
+
+/* Cards hover effect */
+.card {
+    transition: transform 0.3s ease-in-out, box-shadow 0.3s ease-in-out;
+}
+
+.card:hover {
+    transform: translateY(-5px);
+    box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
+}
+
+/* Statistics cards */
+.card .bi {
+    transition: transform 0.3s ease-in-out;
+}
+
+.card:hover .bi {
+    transform: scale(1.1);
+}
+
+/* Features section icons */
+.card .text-primary {
+    transition: color 0.3s ease-in-out;
+}
+
+.card:hover .text-primary {
+    color: #1565c0 !important;
+}
+
+/* Contact form */
+.form-control {
+    border-radius: 0.5rem;
+    padding: 0.75rem 1rem;
+}
+
+.form-control:focus {
+    border-color: #1e88e5;
+    box-shadow: 0 0 0 0.2rem rgba(30, 136, 229, 0.25);
+}
+
+/* Buttons */
+.btn {
+    border-radius: 0.5rem;
+    padding: 0.75rem 1.5rem;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.btn-primary {
+    background: linear-gradient(135deg, #1e88e5 0%, #1565c0 100%);
+    border: none;
+}
+
+.btn-primary:hover {
+    background: linear-gradient(135deg, #1565c0 0%, #0d47a1 100%);
+}
+.py-4 {
+    padding-top: 0rem !important;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+    .display-4 {
+        font-size: 2.5rem;
+    }
+    
+    .lead {
+        font-size: 1.1rem;
+    }
+}

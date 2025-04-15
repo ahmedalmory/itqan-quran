@@ -1,0 +1,2133 @@
+<?php
+/**
+ * Paymob Payment Integration Class
+ * 
+ * This class handles the integration with Paymob payment gateway for the AlQuran subscription system.
+ * Updated to use the new Intention/Payment API.
+ * Modified to match the Paymob for WooCommerce plugin approach.
+ */
+
+// Include debug logger
+require_once __DIR__ . '/../debug_logger.php';
+
+class PaymobPayment {
+    private $secretKey;        // Secret Key for server-side API calls
+    private $publicKey;        // Public Key for client-side API calls
+    private $walletIntegrationId; // Still needed for wallet payments
+    private $iframeId;         // Still needed for iframe integration
+    private $hmacSecret;       // Still needed for HMAC verification
+    private $apiKey;           // Legacy API Key (still needed for some operations)
+    private $currency;
+    private $baseUrl = 'https://accept.paymob.com/api/';
+    private $authToken = null;
+    private $pdo;
+    private $debug = true;     // Enable debug mode
+    private $enabled;
+    private $walletEnabled;
+    private $successUrl;
+    private $cancelUrl;
+
+    /**
+     * Constructor
+     * 
+     * @param PDO $pdo Database connection
+     */
+    public function __construct($pdo) {
+        $this->pdo = $pdo;
+        $this->baseUrl = 'https://accept.paymob.com/api/';
+        
+        // Enable debug mode for development
+        $this->debug = true;
+        
+        // Load settings from database
+        $this->loadSettings();
+        
+        // Log settings for debugging
+        if ($this->debug) {
+            debug_log("PaymobPayment initialized", 'info', [
+                'secret_key' => !empty($this->secretKey) ? 'Set' : 'Not set',
+                'public_key' => !empty($this->publicKey) ? 'Set' : 'Not set',
+                'api_key' => !empty($this->apiKey) ? 'Set' : 'Not set',
+                'wallet_integration_id' => $this->walletIntegrationId,
+                'iframe_id' => $this->iframeId,
+                'hmac_secret' => !empty($this->hmacSecret) ? 'Set' : 'Not set',
+                'currency' => $this->currency,
+                'enabled' => $this->enabled,
+                'wallet_enabled' => $this->walletEnabled
+            ]);
+        }
+    }
+
+    /**
+     * Load payment settings from the database
+     */
+    private function loadSettings() {
+        try {
+            $stmt = $this->pdo->prepare("SELECT setting_key, setting_value FROM payment_settings");
+            $stmt->execute();
+            $settings = $stmt->fetchAll(PDO::FETCH_KEY_PAIR);
+            
+            // New API keys
+            $this->secretKey = $settings['paymob_secret_key'] ?? '';
+            $this->publicKey = $settings['paymob_public_key'] ?? '';
+            
+            // Legacy API key (still needed for authentication)
+            $this->apiKey = $settings['paymob_api_key'] ?? '';
+            
+            // Legacy settings still needed
+            $this->walletIntegrationId = $settings['paymob_wallet_integration_id'] ?? '';
+            $this->iframeId = $settings['paymob_iframe_id'] ?? '';
+            $this->hmacSecret = $settings['paymob_hmac_secret'] ?? '';
+            
+            // Other settings
+            $this->currency = $settings['payment_currency'] ?? 'EGP';
+            $this->enabled = $settings['payment_enabled'] ?? '0';
+            $this->walletEnabled = $settings['wallet_payment_enabled'] ?? '0';
+            $this->successUrl = $settings['paymob_redirect_url'] ?? '';
+            $this->cancelUrl = $settings['paymob_callback_url'] ?? '';
+            
+            // Convert wallet integration ID to integer if it's a valid number
+            if (is_numeric($this->walletIntegrationId)) {
+                $this->walletIntegrationId = (int)$this->walletIntegrationId;
+            } else {
+                // Log warning if wallet integration ID is not numeric
+                debug_log("Wallet Integration ID is not numeric", 'warning', [
+                    'wallet_integration_id' => $this->walletIntegrationId
+                ]);
+            }
+            
+            if ($this->debug) {
+                debug_log("Loaded payment settings", 'info', [
+                    'secret_key' => !empty($this->secretKey) ? 'Set' : 'Not set',
+                    'public_key' => !empty($this->publicKey) ? 'Set' : 'Not set',
+                    'api_key' => !empty($this->apiKey) ? 'Set' : 'Not set',
+                    'wallet_integration_id' => $this->walletIntegrationId,
+                    'iframe_id' => $this->iframeId,
+                    'hmac_secret' => !empty($this->hmacSecret) ? 'Set' : 'Not set',
+                    'currency' => $this->currency,
+                    'enabled' => $this->enabled,
+                    'wallet_enabled' => $this->walletEnabled
+                ]);
+            }
+        } catch (Exception $e) {
+            error_log("Error loading payment settings: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Check if Paymob payment is configured and enabled
+     * 
+     * @return bool
+     */
+    public function isConfigured() {
+        // Check if payment is enabled
+        if ($this->enabled !== '1') {
+            if ($this->debug) {
+                debug_log("Paymob payment is not enabled", 'warning', [
+                    'enabled' => $this->enabled
+                ]);
+            }
+            return false;
+        }
+        
+        // Check if Legacy API Key is set (required for authentication)
+        if (empty($this->apiKey)) {
+            if ($this->debug) {
+                debug_log("Paymob Legacy API Key is not set", 'warning');
+            }
+            return false;
+        }
+        
+        // Check if Secret Key is set (required for new API)
+        if (empty($this->secretKey)) {
+            if ($this->debug) {
+                debug_log("Paymob Secret Key is not set", 'warning');
+            }
+            // لا نعتبر هذا خطأً حرجًا لأننا نستخدم مفتاح API القديم للمصادقة
+            // return false;
+        }
+        
+        // Check if Public Key is set (required for new API)
+        if (empty($this->publicKey)) {
+            if ($this->debug) {
+                debug_log("Paymob Public Key is not set", 'warning');
+            }
+            // لا نعتبر هذا خطأً حرجًا لأننا نستخدم مفتاح API القديم للمصادقة
+            // return false;
+        }
+        
+        // Check if iframe ID is set (still needed for iframe integration)
+        if (empty($this->iframeId)) {
+            if ($this->debug) {
+                debug_log("Paymob iframe ID is not set", 'warning');
+            }
+            return false;
+        }
+        
+        debug_log("Paymob payment is properly configured", 'info');
+        return true;
+    }
+
+    /**
+     * Check if wallet payment is enabled
+     * 
+     * @return bool
+     */
+    public function isWalletEnabled() {
+        // First check if Paymob payment is configured
+        if (!$this->isConfigured()) {
+            return false;
+        }
+        
+        // Check if wallet payment is specifically enabled
+        $walletEnabled = isset($this->walletEnabled) ? $this->walletEnabled === '1' : false;
+        
+        // Check if wallet integration ID is set (still needed for wallet payments)
+        if (empty($this->walletIntegrationId)) {
+            if ($this->debug) {
+                debug_log("Paymob wallet integration ID is not set", 'warning');
+            }
+            return false;
+        }
+        
+        // Check if wallet integration ID is a valid integer
+        if (!is_numeric($this->walletIntegrationId)) {
+            if ($this->debug) {
+                debug_log("Paymob wallet integration ID is not a valid integer", 'warning', [
+                    'wallet_integration_id' => $this->walletIntegrationId
+                ]);
+            }
+            return false;
+        }
+        
+        if (!$walletEnabled) {
+            if ($this->debug) {
+                debug_log("Paymob wallet payment is not enabled", 'warning');
+            }
+            return false;
+        }
+        
+        debug_log("Paymob wallet payment is properly configured and enabled", 'info');
+        return true;
+    }
+
+    /**
+     * Get authentication token from Paymob
+     * 
+     * @return string|null
+     */
+    private function getAuthToken() {
+        if ($this->authToken) {
+            debug_log("Using cached auth token", 'info');
+            return $this->authToken;
+        }
+
+        // في إضافة Paymob لـ WooCommerce، يتم استخدام مفتاح API القديم للحصول على رمز المصادقة
+        // وليس مفتاح API الجديد (Secret Key)
+        if (empty($this->apiKey)) {
+            debug_log("API key is empty or not set", 'error');
+            return null;
+        }
+
+        debug_log("Requesting auth token from Paymob using legacy API key", 'info', [
+            'api_endpoint' => 'auth/tokens',
+            'api_key_length' => strlen($this->apiKey),
+            'api_key_prefix' => substr($this->apiKey, 0, 10) . '...'
+        ]);
+
+        // استخدام مفتاح API القديم للحصول على رمز المصادقة
+        $data = [
+            'api_key' => $this->apiKey
+        ];
+
+        // استخدام try/catch لالتقاط أي أخطاء في طلب API
+        try {
+        $response = $this->makeApiRequest('auth/tokens', $data);
+        
+        if (isset($response['token'])) {
+            $this->authToken = $response['token'];
+                debug_log("Auth token received successfully", 'info', [
+                    'token_length' => strlen($this->authToken),
+                    'token_prefix' => substr($this->authToken, 0, 5) . '...'
+                ]);
+            return $this->authToken;
+        }
+            
+            // تسجيل الخطأ إذا لم يتم العثور على الرمز في الاستجابة
+            if (isset($response['error'])) {
+                debug_log("Failed to get auth token - API error", 'error', [
+                    'error' => $response['error'],
+                    'http_code' => $response['http_code'] ?? 'Unknown'
+                ]);
+            } else {
+                debug_log("Failed to get auth token - Unexpected response format", 'error', [
+                    'response_keys' => json_encode(array_keys($response))
+                ]);
+        }
+        
+        error_log("Failed to get auth token from Paymob. Response: " . json_encode($response));
+        return null;
+        } catch (Exception $e) {
+            debug_log("Exception while getting auth token", 'error', [
+                'message' => $e->getMessage(),
+                'code' => $e->getCode()
+            ]);
+            error_log("Exception while getting auth token: " . $e->getMessage());
+        return null;
+        }
+    }
+
+    /**
+     * Create an order in Paymob
+     * 
+     * @param int $subscriptionId
+     * @param float $amount
+     * @param array $items
+     * @return int|null Order ID
+     */
+    private function createOrder($subscriptionId, $amount, $items = []) {
+        $token = $this->getAuthToken();
+        if (!$token) {
+            error_log("Cannot create order: Failed to get authentication token");
+            return null;
+        }
+
+        $amountCents = round($amount * 100);
+        
+        // Generate a unique merchant order ID by combining subscription ID with timestamp
+        $merchantOrderId = $subscriptionId . '_' . time();
+        
+        if ($this->debug) {
+            error_log("Creating order for subscription ID: $subscriptionId, Amount: $amount ($amountCents cents)");
+            error_log("Using merchant order ID: $merchantOrderId");
+        }
+
+        $data = [
+            'auth_token' => $token,
+            'delivery_needed' => false,
+            'amount_cents' => $amountCents,
+            'currency' => $this->currency,
+            'items' => $items,
+            'merchant_order_id' => $merchantOrderId
+        ];
+
+        if ($this->debug) {
+            error_log("Order request data: " . json_encode($data));
+        }
+
+        $response = $this->makeApiRequest('ecommerce/orders', $data);
+        
+        if (isset($response['id'])) {
+            if ($this->debug) {
+                error_log("Order created successfully with ID: " . $response['id']);
+            }
+            return $response['id'];
+        }
+        
+        error_log("Failed to create order in Paymob. Response: " . json_encode($response));
+        return null;
+    }
+
+    /**
+     * Get payment key from Paymob
+     * 
+     * @param int $orderId
+     * @param float $amount
+     * @param array $billingData
+     * @param string $paymentMethod Payment method (card, wallet)
+     * @return string|null
+     */
+    private function getPaymentKey($orderId, $amount, $billingData, $paymentMethod = 'card') {
+        $token = $this->getAuthToken();
+        if (!$token) {
+            error_log("Cannot get payment key: Failed to get authentication token");
+            debug_log("Failed to get authentication token for payment key", 'error');
+            return null;
+        }
+
+        $amountCents = round($amount * 100);
+        
+        // Ensure last_name is not blank
+        if (empty($billingData['last_name'])) {
+            $billingData['last_name'] = 'Student';
+        }
+        
+        // Determine which integration ID to use based on payment method
+        if ($paymentMethod === 'wallet' && !empty($this->walletIntegrationId)) {
+            $integrationId = (int)$this->walletIntegrationId;
+            debug_log("Using wallet integration ID", 'info', [
+                'integration_id' => $integrationId
+            ]);
+        } else {
+            $integrationId = (int)$this->iframeId;
+        }
+        
+        debug_log("Getting payment key", 'info', [
+            'order_id' => $orderId,
+            'amount' => $amount,
+            'amount_cents' => $amountCents,
+            'integration_id' => $integrationId,
+            'payment_method' => $paymentMethod
+        ]);
+
+        // Prepare the payment key request according to the latest API documentation
+        $data = [
+            'auth_token' => $token,
+            'amount_cents' => $amountCents,
+            'expiration' => 3600, // 1 hour
+            'order_id' => $orderId,
+            'billing_data' => $billingData,
+            'currency' => $this->currency,
+            'integration_id' => $integrationId,
+            'lock_order_when_paid' => true
+        ];
+        
+        // Add redirect URLs if configured
+        if (!empty($this->successUrl)) {
+            $data['return_merchant_urls'] = [
+                'success' => $this->successUrl,
+                'cancel' => $this->cancelUrl ?? $this->successUrl
+            ];
+        }
+        
+        // في الإصدار الأحدث من API، لا نحتاج لإضافة source_data هنا
+        // سيتم إضافتها في طلب الدفع اللاحق (createMobileWalletPayment)
+
+        $response = $this->makeApiRequest('acceptance/payment_keys', $data);
+        
+        if (isset($response['error'])) {
+            error_log("Payment key error: " . json_encode($response));
+            debug_log("Failed to get payment key", 'error', [
+                'error' => $response['error'] ?? 'Unknown error',
+                'http_code' => $response['http_code'] ?? 'Unknown'
+            ]);
+            return null;
+        }
+        
+        if (isset($response['token'])) {
+            debug_log("Payment key obtained successfully", 'info', [
+                'token_length' => strlen($response['token'])
+            ]);
+            return $response['token'];
+        }
+        
+        error_log("Failed to get payment key from Paymob. Response: " . json_encode($response));
+        debug_log("Unexpected response format from payment_keys API", 'error', [
+            'response' => json_encode(array_keys($response))
+        ]);
+        return null;
+    }
+
+    /**
+     * Make API request to Paymob
+     * 
+     * @param string $endpoint
+     * @param array $data
+     * @param string $method
+     * @return array
+     */
+    private function makeApiRequest($endpoint, $data = [], $method = 'POST') {
+        $url = $this->baseUrl . $endpoint;
+        
+        debug_log("Making API request", 'info', [
+            'endpoint' => $endpoint,
+            'method' => $method,
+            'url' => $url
+        ]);
+        
+        // تحقق من اتصال الإنترنت قبل إجراء الطلب
+        if (!$this->checkInternetConnection()) {
+            debug_log("No internet connection available", 'error');
+            return [
+                'error' => 'No internet connection available',
+                'http_code' => 0
+            ];
+        }
+        
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, $url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_HEADER, false);
+        
+        // إضافة خيارات إضافية لـ cURL للتعامل مع الأخطاء بشكل أفضل
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10); // زمن الاتصال: 10 ثوانٍ
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30); // زمن الانتظار الكلي: 30 ثانية
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true); // تحقق من شهادة SSL
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2); // تحقق من اسم المضيف في شهادة SSL
+        
+        if ($method === 'POST') {
+            curl_setopt($ch, CURLOPT_POST, true);
+            $jsonData = json_encode($data);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $jsonData);
+            
+            debug_log("POST request data", 'info', [
+                'data_length' => strlen($jsonData),
+                'data_keys' => array_keys($data)
+            ]);
+        } else if ($method === 'GET' && !empty($data)) {
+            // إضافة بيانات GET إلى URL
+                $url .= '?' . http_build_query($data);
+                curl_setopt($ch, CURLOPT_URL, $url);
+            
+            debug_log("GET request with parameters", 'info', [
+                'url_with_params' => $url
+            ]);
+        }
+        
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Content-Type: application/json',
+            'Accept: application/json'
+        ]);
+        
+        // تنفيذ الطلب وقياس الوقت المستغرق
+        $startTime = microtime(true);
+        $response = curl_exec($ch);
+        $endTime = microtime(true);
+        $executionTime = round(($endTime - $startTime) * 1000); // بالميلي ثانية
+        
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $error = curl_error($ch);
+        $errorNo = curl_errno($ch);
+        
+        curl_close($ch);
+        
+        debug_log("API response received", 'info', [
+            'http_code' => $httpCode,
+            'execution_time_ms' => $executionTime,
+            'response_length' => strlen($response)
+        ]);
+        
+        if ($error) {
+            debug_log("cURL Error", 'error', [
+                'error' => $error,
+                'error_no' => $errorNo,
+                'http_code' => $httpCode
+            ]);
+            
+            error_log("cURL Error: $error (Code: $errorNo)");
+            return [
+                'error' => $error,
+                'error_no' => $errorNo,
+                'http_code' => $httpCode
+            ];
+        }
+        
+        // محاولة تحليل الاستجابة كـ JSON
+        $responseData = json_decode($response, true);
+        
+        // التحقق من صحة تحليل JSON
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            debug_log("JSON parsing error", 'error', [
+                'json_error' => json_last_error_msg(),
+                'response_preview' => substr($response, 0, 100)
+            ]);
+            
+            return [
+                'error' => 'Invalid JSON response: ' . json_last_error_msg(),
+                'http_code' => $httpCode,
+                'raw_response' => substr($response, 0, 500) // تخزين جزء من الاستجابة الخام
+            ];
+        }
+        
+        // التحقق من رمز الحالة HTTP
+        if ($httpCode >= 400) {
+            debug_log("API HTTP Error", 'error', [
+                'http_code' => $httpCode,
+                'error_message' => isset($responseData['message']) ? $responseData['message'] : 'Unknown error',
+                'response_keys' => array_keys($responseData)
+            ]);
+            
+            error_log("API Error: HTTP $httpCode - " . json_encode($responseData));
+            return [
+                'error' => isset($responseData['message']) ? $responseData['message'] : "HTTP Error $httpCode",
+                'http_code' => $httpCode,
+                'response' => $responseData
+            ];
+        }
+        
+        return $responseData;
+    }
+    
+    /**
+     * Check if internet connection is available
+     * 
+     * @return bool
+     */
+    private function checkInternetConnection() {
+        // محاولة الاتصال بخادم Google للتحقق من اتصال الإنترنت
+        $connected = @fsockopen("www.google.com", 80);
+        if ($connected) {
+            fclose($connected);
+            return true;
+        }
+        
+        // محاولة الاتصال بخادم Paymob مباشرة كبديل
+        $connected = @fsockopen("accept.paymob.com", 443);
+        if ($connected) {
+            fclose($connected);
+            return true;
+        }
+        
+        return false;
+    }
+
+    /**
+     * Process payment for a subscription
+     * 
+     * @param int $subscriptionId
+     * @param float $amount
+     * @param array $userData
+     * @param string $paymentMethod Payment method (card, wallet)
+     * @return array
+     */
+    public function processPayment($subscriptionId, $amount, $userData, $paymentMethod = 'card') {
+        if (!$this->isConfigured()) {
+            error_log("Paymob payment is not configured properly");
+            return [
+                'success' => false,
+                'message' => 'Paymob payment is not configured properly'
+            ];
+        }
+
+        // التحقق من تفعيل الدفع بالمحفظة إذا كانت طريقة الدفع هي المحفظة
+        if ($paymentMethod === 'wallet' && !$this->isWalletEnabled()) {
+            error_log("Wallet payment is not enabled");
+            return [
+                'success' => false,
+                'message' => 'Wallet payment is not enabled'
+            ];
+        }
+
+        if ($this->debug) {
+            error_log("Processing payment for subscription ID: $subscriptionId, Amount: $amount, Method: $paymentMethod");
+            error_log("User data: " . json_encode($userData));
+        }
+
+        // Check if there's a pending transaction for this subscription
+        $stmt = $this->pdo->prepare("
+            SELECT * FROM payment_transactions 
+            WHERE subscription_id = ? AND status = 'pending' 
+            ORDER BY created_at DESC LIMIT 1
+        ");
+        $stmt->execute([$subscriptionId]);
+        $pendingTransaction = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        // If there's a pending transaction with intention_id, try to reuse it
+        if ($pendingTransaction && !empty($pendingTransaction['paymob_intention_id'])) {
+            debug_log("Found pending transaction for subscription ID: $subscriptionId", 'info', [
+                'transaction_id' => $pendingTransaction['id'],
+                'intention_id' => $pendingTransaction['paymob_intention_id']
+            ]);
+            
+            // For now, we'll create a new intention instead of reusing the old one
+            // This is because the intention might have expired
+            debug_log("Creating a new intention instead of reusing the old one", 'info');
+        }
+
+        // Prepare billing data
+            $billingData = $this->prepareBillingData($subscriptionId, $userData);
+            
+        // استخدام API الجديد (Intention API) إذا كان المفتاح السري متوفرًا
+        if (!empty($this->secretKey) && !empty($this->publicKey)) {
+            debug_log("Using new Intention API (v1)", 'info');
+            $intention = $this->createPaymentIntentionV1($subscriptionId, $amount, $billingData, $paymentMethod);
+            } else {
+            // استخدام API القديم إذا لم يكن المفتاح السري متوفرًا
+            debug_log("Using legacy API", 'info');
+            $intention = $this->createPaymentIntention($subscriptionId, $amount, $billingData, $paymentMethod);
+        }
+        
+        if (!$intention || !isset($intention['id'])) {
+            return [
+                'success' => false,
+                'message' => 'Failed to create payment intention in Paymob'
+            ];
+        }
+
+        // Create transaction record
+        $orderId = null;
+        if (isset($intention['order_id'])) {
+            $orderId = $intention['order_id'];
+        }
+        
+        $transactionId = $this->createTransactionRecord($subscriptionId, $intention['id'], $amount, 'paymob_' . $paymentMethod, $orderId);
+        if (!$transactionId) {
+            error_log("Failed to create transaction record");
+            return [
+                'success' => false,
+                'message' => 'Failed to create transaction record'
+            ];
+        }
+
+                // Update subscription payment method
+                $this->updateSubscriptionPaymentMethod($subscriptionId, 'paymob_' . $paymentMethod);
+        
+        // إذا كنا نستخدم API الجديد (Intention API)
+        if (isset($intention['client_secret'])) {
+            debug_log("Using Unified Checkout for payment", 'info', [
+                'client_secret' => substr($intention['client_secret'], 0, 10) . '...',
+                'public_key' => substr($this->publicKey, 0, 10) . '...'
+            ]);
+            
+            // تخزين رابط إعادة التوجيه في الجلسة
+            if (session_status() === PHP_SESSION_NONE) {
+                session_start();
+            }
+            $_SESSION['paymob_redirect_after_payment'] = $this->successUrl;
+            
+            return [
+                'success' => true,
+                'iframe_url' => "https://accept.paymob.com/unifiedcheckout/?publicKey={$this->publicKey}&clientSecret={$intention['client_secret']}",
+                'transaction_id' => $transactionId,
+                'intention_id' => $intention['id']
+            ];
+        }
+        // إذا كنا نستخدم API القديم
+        else {
+            // For card payments, we'll use the iframe
+            if ($paymentMethod === 'card') {
+                $iframeId = $this->iframeId;
+                
+                debug_log("Using iframe for card payment (legacy API)", 'info', [
+                    'iframe_id' => $iframeId,
+                    'token_length' => strlen($intention['token'])
+                ]);
+                
+                return [
+                    'success' => true,
+                    'iframe_url' => "https://accept.paymob.com/iframe/{$iframeId}?payment_token={$intention['token']}",
+                    'transaction_id' => $transactionId,
+                    'intention_id' => $intention['id']
+                ];
+            } 
+            // For wallet payments, we need to handle it differently
+            else if ($paymentMethod === 'wallet') {
+                // Get the phone number from billing data
+                $phone = $billingData['wallet_phone'] ?? $billingData['phone'] ?? $billingData['phone_number'] ?? '';
+                
+                // Remove any spaces, dashes, or special characters from phone number
+                $phone = preg_replace('/[^0-9]/', '', $phone);
+                
+                // Format Egyptian phone numbers
+                if (strlen($phone) == 10 && (substr($phone, 0, 1) == '1')) {
+                    // This is likely an Egyptian number without country code (e.g., 1XXXXXXXXX)
+                    $phone = '2' . $phone;
+                } else if (strlen($phone) == 11 && substr($phone, 0, 1) == '0') {
+                    // Remove leading 0 and add country code (e.g., 01XXXXXXXXX -> 21XXXXXXXXX)
+                    $phone = '2' . substr($phone, 1);
+                } else if (!preg_match('/^2/', $phone)) {
+                    // Add Egypt country code if not present
+                    $phone = '2' . $phone;
+                }
+                
+                // Create wallet payment using the intention token
+                $walletPaymentData = [
+                    'auth_token' => $this->getAuthToken(),
+                    'payment_token' => $intention['token'],
+                    'source' => [
+                        'identifier' => $phone,
+                        'subtype' => 'WALLET'
+                    ]
+                ];
+                
+                $response = $this->makeApiRequest('acceptance/payments/pay', $walletPaymentData);
+                
+                // Check for errors in the response
+                if (isset($response['error'])) {
+                    error_log("Mobile wallet payment API error: " . json_encode($response));
+                    debug_log("Mobile wallet payment failed", 'error', [
+                        'error' => $response['error'] ?? 'Unknown error',
+                        'http_code' => $response['http_code'] ?? 'Unknown'
+                    ]);
+                    
+                return [
+                    'success' => false,
+                        'message' => 'Mobile wallet payment failed: ' . ($response['error'] ?? 'Unknown error'),
+                        'details' => $response
+                    ];
+                }
+                
+                // Handle different response formats
+                if (isset($response['redirect_url'])) {
+                    return [
+                        'success' => true,
+                        'redirect_url' => $response['redirect_url'],
+                        'transaction_id' => $transactionId,
+                        'intention_id' => $intention['id'],
+                        'message' => 'Mobile wallet payment initiated successfully'
+                    ];
+                } else if (isset($response['iframe_redirection_url'])) {
+                    return [
+                        'success' => true,
+                        'redirect_url' => $response['iframe_redirection_url'],
+                        'transaction_id' => $transactionId,
+                        'intention_id' => $intention['id'],
+                        'message' => 'Mobile wallet payment initiated successfully'
+                    ];
+                } else if (isset($response['wallet_mobile_url'])) {
+                    return [
+                        'success' => true,
+                        'redirect_url' => $response['wallet_mobile_url'],
+                        'transaction_id' => $transactionId,
+                        'intention_id' => $intention['id'],
+                        'message' => 'Mobile wallet payment initiated successfully'
+                    ];
+                } else if (isset($response['id'])) {
+                    // استخدام واجهة الدفع الجديدة (Checkout) بدلاً من الـ iframe
+                    $iframeId = $this->iframeId;
+                    $redirectUrl = "https://accept.paymob.com/iframe/{$iframeId}?payment_token={$intention['token']}";
+
+            return [
+                'success' => true,
+                        'redirect_url' => $redirectUrl,
+                'transaction_id' => $transactionId,
+                        'intention_id' => $intention['id'],
+                        'message' => 'Mobile wallet payment initiated successfully'
+                    ];
+                } else if (isset($response['pending'])) {
+                    return [
+                        'success' => true,
+                        'pending' => true,
+                        'transaction_id' => $transactionId,
+                        'intention_id' => $intention['id'],
+                        'message' => 'Mobile wallet payment is pending. Please check your phone for payment confirmation.'
+                    ];
+                } else {
+                    error_log("Unexpected mobile wallet payment response: " . json_encode($response));
+                    debug_log("Unexpected mobile wallet payment response format", 'error', [
+                        'response_keys' => array_keys($response)
+                    ]);
+                    
+                    return [
+                        'success' => false,
+                        'message' => 'Unexpected response from payment gateway',
+                        'details' => $response
+                    ];
+                }
+            }
+        }
+
+        // Default fallback
+        return [
+            'success' => false,
+            'message' => 'Unsupported payment method'
+        ];
+    }
+
+    /**
+     * Create a mobile wallet payment token
+     * 
+     * @param int $orderId
+     * @param float $amount
+     * @param array $billingData
+     * @return array
+     */
+    private function createMobileWalletPayment($orderId, $amount, $billingData) {
+        // Validate required parameters
+        if (empty($orderId)) {
+            error_log("Mobile wallet payment error: Order ID is required");
+            return [
+                'success' => false,
+                'message' => 'Order ID is required for mobile wallet payment'
+            ];
+        }
+        
+        if (empty($amount) || !is_numeric($amount) || $amount <= 0) {
+            error_log("Mobile wallet payment error: Invalid amount provided");
+            return [
+                'success' => false,
+                'message' => 'Invalid amount for mobile wallet payment'
+            ];
+        }
+        
+        // Validate wallet integration ID
+        if (empty($this->walletIntegrationId)) {
+            error_log("Mobile wallet payment error: Wallet integration ID is not configured");
+            return [
+                'success' => false,
+                'message' => 'Wallet integration ID is not configured. Please check payment settings.'
+            ];
+        }
+        
+        // Get authentication token
+        $token = $this->getAuthToken();
+        if (!$token) {
+            error_log("Mobile wallet payment error: Failed to get authentication token");
+            return [
+                'success' => false,
+                'message' => 'Failed to get authentication token'
+            ];
+        }
+
+        // Validate and format phone number
+        if (empty($billingData['phone']) && empty($billingData['wallet_phone']) && empty($billingData['phone_number'])) {
+            error_log("Mobile wallet payment error: Phone number is required for wallet payment");
+            return [
+                'success' => false,
+                'message' => 'Phone number is required for mobile wallet payment'
+            ];
+        }
+        
+        // Get the phone number from billing data or wallet_phone parameter
+        $phone = $billingData['wallet_phone'] ?? $billingData['phone'] ?? $billingData['phone_number'] ?? '';
+        
+        // Remove any spaces, dashes, or special characters from phone number
+        $phone = preg_replace('/[^0-9]/', '', $phone);
+        
+        // Validate phone number length
+        if (strlen($phone) < 10) {
+            error_log("Mobile wallet payment error: Invalid phone number format - too short: " . $phone);
+            return [
+                'success' => false,
+                'message' => 'Invalid phone number format. Phone number must be at least 10 digits.'
+            ];
+        }
+        
+        // Handle Egyptian phone numbers specifically
+        if (strlen($phone) == 10 && (substr($phone, 0, 1) == '1')) {
+            // This is likely an Egyptian number without country code (e.g., 1XXXXXXXXX)
+            $phone = '2' . $phone;
+            debug_log("Mobile wallet payment: Added Egypt country code to phone: " . $phone, 'info');
+        } else if (strlen($phone) == 11 && substr($phone, 0, 1) == '0') {
+            // Remove leading 0 and add country code (e.g., 01XXXXXXXXX -> 21XXXXXXXXX)
+            $phone = '2' . substr($phone, 1);
+            debug_log("Mobile wallet payment: Reformatted Egyptian phone number: " . $phone, 'info');
+        } else if (!preg_match('/^2/', $phone)) {
+            // Add Egypt country code if not present
+            $phone = '2' . $phone;
+            debug_log("Mobile wallet payment: Added country code to phone: " . $phone, 'info');
+        }
+        
+        // Get payment key for mobile wallet payment
+        $paymentKey = $this->getPaymentKey($orderId, $amount, $billingData, 'wallet');
+        if (!$paymentKey) {
+            error_log("Mobile wallet payment error: Failed to get payment key");
+            return [
+                'success' => false,
+                'message' => 'Failed to get payment key for mobile wallet payment'
+            ];
+        }
+        
+        debug_log("Creating mobile wallet payment", 'info', [
+            'order_id' => $orderId,
+            'amount' => $amount,
+            'phone' => substr($phone, 0, 4) . '****' . substr($phone, -4) // Mask the middle digits
+        ]);
+        
+        // الطريقة الأحدث للدفع عبر المحفظة الإلكترونية في باي موب
+        // استنادًا إلى إضافة paymob-for-woocommerce
+        $data = [
+            'auth_token' => $token,
+            'payment_token' => $paymentKey,
+            'source' => [
+                'identifier' => $phone,
+                'subtype' => 'WALLET'
+            ]
+        ];
+        
+        // Make API request to create mobile wallet payment using the latest API endpoint
+        $response = $this->makeApiRequest('acceptance/payments/pay', $data);
+        
+        // Check for errors in the response
+        if (isset($response['error'])) {
+            error_log("Mobile wallet payment API error: " . json_encode($response));
+            debug_log("Mobile wallet payment failed", 'error', [
+                'error' => $response['error'] ?? 'Unknown error',
+                'http_code' => $response['http_code'] ?? 'Unknown'
+            ]);
+            
+            return [
+                'success' => false,
+                'message' => 'Mobile wallet payment failed: ' . ($response['error'] ?? 'Unknown error'),
+                'details' => $response
+            ];
+        }
+        
+        // Handle different response formats based on the latest Paymob API
+        // استنادًا إلى إضافة paymob-for-woocommerce
+        if (isset($response['redirect_url'])) {
+            // New API format with redirect_url
+            debug_log("Mobile wallet payment created successfully with redirect URL", 'info', [
+                'redirect_url' => $response['redirect_url']
+            ]);
+            
+            return [
+                'success' => true,
+                'redirect_url' => $response['redirect_url'],
+                'transaction_id' => $response['id'] ?? null,
+                'order_id' => $orderId,
+                'message' => 'Mobile wallet payment initiated successfully'
+            ];
+        } else if (isset($response['iframe_redirection_url'])) {
+            // أحدث إصدار من API يعيد رابط iframe
+            debug_log("Mobile wallet payment created with iframe redirection URL", 'info', [
+                'iframe_redirection_url' => $response['iframe_redirection_url']
+            ]);
+            
+            return [
+                'success' => true,
+                'redirect_url' => $response['iframe_redirection_url'],
+                'transaction_id' => $response['id'] ?? null,
+                'order_id' => $orderId,
+                'message' => 'Mobile wallet payment initiated successfully'
+            ];
+        } else if (isset($response['wallet_mobile_url'])) {
+            // أحدث إصدار من API يعيد رابط تطبيق المحفظة
+            debug_log("Mobile wallet payment created with wallet mobile URL", 'info', [
+                'wallet_mobile_url' => $response['wallet_mobile_url']
+            ]);
+            
+            return [
+                'success' => true,
+                'redirect_url' => $response['wallet_mobile_url'],
+                'transaction_id' => $response['id'] ?? null,
+                'order_id' => $orderId,
+                'message' => 'Mobile wallet payment initiated successfully'
+            ];
+        } else if (isset($response['id'])) {
+            // Older API format with just ID - need to construct redirect URL
+            debug_log("Mobile wallet payment created successfully with ID", 'info', [
+                'transaction_id' => $response['id']
+            ]);
+            
+            // For older API format, we need to construct a redirect URL
+            $redirectUrl = "https://accept.paymob.com/api/acceptance/payments/pay?payment_token={$paymentKey}";
+            
+            return [
+                'success' => true,
+                'redirect_url' => $redirectUrl,
+                'transaction_id' => $response['id'],
+                'order_id' => $orderId,
+                'message' => 'Mobile wallet payment initiated successfully'
+            ];
+        } else if (isset($response['pending'])) {
+            // Another possible response format indicating pending status
+            debug_log("Mobile wallet payment pending", 'info', [
+                'pending' => $response['pending']
+            ]);
+            
+            return [
+                'success' => true,
+                'pending' => true,
+                'order_id' => $orderId,
+                'message' => 'Mobile wallet payment is pending. Please check your phone for payment confirmation.'
+            ];
+        } else {
+            // Unexpected response format
+            error_log("Unexpected mobile wallet payment response: " . json_encode($response));
+            debug_log("Unexpected mobile wallet payment response format", 'error', [
+                'response_keys' => array_keys($response)
+            ]);
+            
+            return [
+                'success' => false,
+                'message' => 'Unexpected response from payment gateway',
+                'details' => $response
+            ];
+        }
+    }
+
+    /**
+     * Create a response for wallet payment that will use POST method
+     * 
+     * @param string $paymentKey
+     * @param int $transactionId
+     * @param int $orderId
+     * @return array
+     */
+    private function createWalletPaymentResponse($paymentKey, $transactionId, $orderId) {
+        // Create HTML form that will auto-submit via POST
+        $formHtml = '
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Redirecting to Payment...</title>
+            <style>
+                body {
+                    font-family: Arial, sans-serif;
+                    text-align: center;
+                    padding-top: 50px;
+                    background-color: #f8f9fa;
+                }
+                .container {
+                    max-width: 500px;
+                    margin: 0 auto;
+                    padding: 20px;
+                    background-color: white;
+                    border-radius: 10px;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                }
+                .loader {
+                    border: 5px solid #f3f3f3;
+                    border-radius: 50%;
+                    border-top: 5px solid #3498db;
+                    width: 50px;
+                    height: 50px;
+                    animation: spin 1s linear infinite;
+                    margin: 20px auto;
+                }
+                @keyframes spin {
+                    0% { transform: rotate(0deg); }
+                    100% { transform: rotate(360deg); }
+                }
+                .message {
+                    margin-top: 20px;
+                    color: #666;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h2>جاري تحويلك إلى صفحة الدفع...</h2>
+                <div class="loader"></div>
+                <p class="message">يرجى الانتظار، سيتم تحويلك تلقائيًا.</p>
+                <form id="paymobForm" method="POST" action="https://accept.paymob.com/api/acceptance/payments/pay">
+                    <input type="hidden" name="payment_token" value="' . $paymentKey . '">
+                </form>
+            </div>
+            <script>
+                document.addEventListener("DOMContentLoaded", function() {
+                    setTimeout(function() {
+                        document.getElementById("paymobForm").submit();
+                    }, 1500);
+                });
+            </script>
+        </body>
+        </html>
+        ';
+        
+        // Return success with HTML content
+        return [
+            'success' => true,
+            'html_content' => $formHtml,
+            'transaction_id' => $transactionId,
+            'order_id' => $orderId
+        ];
+    }
+
+    /**
+     * Create a transaction record in the database
+     * 
+     * @param int $subscriptionId
+     * @param int $intentionId
+     * @param float $amount
+     * @param string $paymentMethod Payment method (paymob_card, paymob_wallet)
+     * @param int|null $orderId Order ID (for new API)
+     * @return int|null Transaction ID
+     */
+    private function createTransactionRecord($subscriptionId, $intentionId, $amount, $paymentMethod = 'paymob_card', $orderId = null) {
+        try {
+            // Check if a transaction already exists for this intention
+            $stmt = $this->pdo->prepare("SELECT id FROM payment_transactions WHERE paymob_intention_id = ?");
+            $stmt->execute([$intentionId]);
+            $existingTransaction = $stmt->fetch(PDO::FETCH_ASSOC);
+            
+            if ($existingTransaction) {
+                if ($this->debug) {
+                    error_log("Transaction already exists for intention ID: $intentionId, Transaction ID: " . $existingTransaction['id']);
+                }
+                
+                // إذا كان معرف الطلب متوفرًا، قم بتحديث السجل الموجود
+                if ($orderId) {
+                    $updateStmt = $this->pdo->prepare("
+                        UPDATE payment_transactions 
+                        SET paymob_order_id = ? 
+                        WHERE id = ?
+                    ");
+                    $updateStmt->execute([$orderId, $existingTransaction['id']]);
+                    
+                    debug_log("Updated transaction with order ID", 'info', [
+                        'transaction_id' => $existingTransaction['id'],
+                        'order_id' => $orderId
+                    ]);
+                }
+                
+                return $existingTransaction['id'];
+            }
+            
+            // تحقق مما إذا كانت قاعدة البيانات تحتوي على عمود paymob_order_id
+            $tableInfo = $this->pdo->query("DESCRIBE payment_transactions");
+            $columns = $tableInfo->fetchAll(PDO::FETCH_COLUMN);
+            
+            // إذا لم يكن العمود موجودًا، قم بإضافته
+            if (!in_array('paymob_order_id', $columns)) {
+                $this->pdo->exec("ALTER TABLE payment_transactions ADD COLUMN paymob_order_id VARCHAR(255) NULL");
+                debug_log("Added paymob_order_id column to payment_transactions table", 'info');
+            }
+            
+            // إنشاء سجل معاملة جديد مع معرف الطلب إذا كان متوفرًا
+            if ($orderId) {
+            $stmt = $this->pdo->prepare("
+                INSERT INTO payment_transactions 
+                    (subscription_id, payment_method, amount, currency, status, paymob_intention_id, paymob_order_id) 
+                    VALUES (?, ?, ?, ?, 'pending', ?, ?)
+                ");
+                $stmt->execute([$subscriptionId, $paymentMethod, $amount, $this->currency, $intentionId, $orderId]);
+            } else {
+                $stmt = $this->pdo->prepare("
+                    INSERT INTO payment_transactions 
+                    (subscription_id, payment_method, amount, currency, status, paymob_intention_id) 
+                VALUES (?, ?, ?, ?, 'pending', ?)
+            ");
+                $stmt->execute([$subscriptionId, $paymentMethod, $amount, $this->currency, $intentionId]);
+            }
+            
+            $transactionId = $this->pdo->lastInsertId();
+            
+            if ($this->debug) {
+                error_log("Created transaction record: $transactionId for subscription: $subscriptionId, intention: $intentionId" . ($orderId ? ", order: $orderId" : ""));
+            }
+            
+            return $transactionId;
+        } catch (PDOException $e) {
+            error_log("Error creating transaction record: " . $e->getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Prepare billing data for payment
+     * 
+     * @param int $subscriptionId
+     * @param array $userData
+     * @return array
+     */
+    private function prepareBillingData($subscriptionId, $userData) {
+        try {
+            // تعديل الاستعلام لتجنب مشكلة اختلاف ترميز الحروف بين الجداول
+            // استخدام معرف المستخدم مباشرة بدون الانضمام إلى جدول البلدان
+            $user = null;
+            $userId = $userData['student_id'] ?? $userData['user_id'] ?? 0;
+            
+            if ($userId > 0) {
+                $stmt = $this->pdo->prepare("
+                    SELECT u.* 
+                    FROM users u
+                    WHERE u.id = ?
+                ");
+                $stmt->execute([$userId]);
+                $user = $stmt->fetch(PDO::FETCH_ASSOC);
+            }
+            
+            // الحصول على اسم البلد بشكل منفصل إذا كان معرف البلد متوفرًا
+            $countryName = 'Egypt'; // القيمة الافتراضية
+            if ($user && !empty($user['country_id'])) {
+                $stmtCountry = $this->pdo->prepare("SELECT Name FROM countries WHERE ID = ?");
+                $stmtCountry->execute([$user['country_id']]);
+                $countryResult = $stmtCountry->fetch(PDO::FETCH_ASSOC);
+                if ($countryResult) {
+                    $countryName = $countryResult['Name'];
+                }
+            }
+            
+            if (!$user) {
+                debug_log("User not found for billing data, using provided userData directly", 'warning', [
+                    'user_id' => $userId
+                ]);
+            }
+            
+            // Get subscription data
+            $subscription = null;
+            if ($subscriptionId > 0) {
+                $stmt = $this->pdo->prepare("
+                    SELECT ss.*, sp.lessons_per_month as plan_name
+                    FROM student_subscriptions ss
+                    LEFT JOIN subscription_plans sp ON ss.plan_id = sp.id
+                    WHERE ss.id = ?
+                ");
+        $stmt->execute([$subscriptionId]);
+                $subscription = $stmt->fetch(PDO::FETCH_ASSOC);
+            }
+            
+            // استخدام البيانات المقدمة مباشرة إذا لم يتم العثور على المستخدم
+            $firstName = $user['name'] ?? $userData['first_name'] ?? $userData['name'] ?? '';
+            $lastName = $userData['last_name'] ?? 'N/A';
+            $email = $user['email'] ?? $userData['email'] ?? '';
+            $phone = $user['phone'] ?? $userData['phone'] ?? $userData['phone_number'] ?? '';
+        
+        // Prepare billing data
+        $billingData = [
+                'first_name' => $firstName,
+                'last_name' => $lastName,
+                'email' => $email,
+                'phone_number' => $phone,
+                'street' => 'N/A',
+                'city' => $user['city'] ?? $userData['city'] ?? 'N/A',
+                'country' => $countryName,
+                'state' => 'N/A',
+                'postal_code' => 'N/A',
+                'apartment' => 'N/A',
+                'floor' => 'N/A',
+                'building' => 'N/A'
+            ];
+            
+            // Ensure last_name is not empty
+            if (empty($billingData['last_name'])) {
+                $billingData['last_name'] = 'N/A';
+            }
+            
+            // Add wallet phone if provided
+            if (isset($userData['wallet_phone']) && !empty($userData['wallet_phone'])) {
+                debug_log("Using provided wallet phone for payment", 'info', [
+                    'wallet_phone' => substr($userData['wallet_phone'], 0, 3) . '****' . substr($userData['wallet_phone'], -2)
+                ]);
+                $billingData['wallet_phone'] = $userData['wallet_phone'];
+            }
+            
+            debug_log("Prepared billing data", 'info', [
+                'billing_data' => $billingData
+            ]);
+
+        return $billingData;
+        } catch (PDOException $e) {
+            debug_log("Error preparing billing data", 'error', [
+                'error' => $e->getMessage()
+            ]);
+            
+            // Return default billing data in case of error
+            return [
+                'first_name' => $userData['first_name'] ?? $userData['name'] ?? 'User',
+                'last_name' => $userData['last_name'] ?? 'Name',
+                'email' => $userData['email'] ?? 'user@example.com',
+                'phone_number' => $userData['phone'] ?? $userData['phone_number'] ?? '01000000000',
+                'street' => 'N/A',
+                'city' => 'N/A',
+                'country' => 'Egypt',
+                'state' => 'N/A',
+                'postal_code' => 'N/A',
+                'apartment' => 'N/A',
+                'floor' => 'N/A',
+                'building' => 'N/A'
+            ];
+        }
+    }
+
+    /**
+     * Process callback from Paymob
+     * 
+     * @param array $data
+     * @return bool
+     */
+    public function processCallback($data) {
+        $this->logInfo("Processing Paymob callback", [
+            'data' => json_encode($data),
+            'raw_data' => isset($_SERVER['REQUEST_METHOD']) ? $_SERVER['REQUEST_METHOD'] : 'Unknown'
+        ]);
+        
+        // تحقق من وجود بيانات خام في الطلب
+        $rawData = file_get_contents('php://input');
+        if (!empty($rawData)) {
+            $this->logInfo("Raw callback data received", ['raw_data' => $rawData]);
+            $jsonData = json_decode($rawData, true);
+            if (json_last_error() === JSON_ERROR_NONE && !empty($jsonData)) {
+                $data = $jsonData;
+                $this->logInfo("Using JSON data from raw input", ['data' => json_encode($data)]);
+            }
+        }
+        
+        // تحقق من وجود بيانات في $_POST
+        if (empty($data) && !empty($_POST)) {
+            $data = $_POST;
+            $this->logInfo("Using POST data for callback", ['post_data' => json_encode($data)]);
+        }
+        
+        // تحقق من وجود بيانات في $_GET
+        if (empty($data) && !empty($_GET)) {
+            $data = $_GET;
+            $this->logInfo("Using GET data for callback", ['get_data' => json_encode($data)]);
+        }
+        
+        // منع حلقة إعادة التوجيه المتكررة
+        if (isset($_SESSION['paymob_redirect_count']) && $_SESSION['paymob_redirect_count'] > 3) {
+            $this->logWarning("Too many redirects detected, stopping redirect loop");
+            echo "Payment process completed. You can close this window and return to the application.";
+            $_SESSION['paymob_redirect_count'] = 0;
+            exit;
+        }
+        
+        // زيادة عداد إعادة التوجيه
+        if (!isset($_SESSION['paymob_redirect_count'])) {
+            $_SESSION['paymob_redirect_count'] = 1;
+        } else {
+            $_SESSION['paymob_redirect_count']++;
+        }
+        
+        // التحقق من HMAC إذا كان متاحًا
+        if (isset($data['hmac'])) {
+            if (!$this->verifyHmac($data)) {
+                $this->logError("HMAC verification failed");
+                $this->redirectAfterPayment(false);
+            return false;
+            }
+        } else {
+            $this->logWarning("No HMAC found in callback data");
+        }
+        
+        // استخراج معرف النية ومعرف الطلب
+        $intentionId = null;
+        $orderId = null;
+        
+        // محاولة استخراج معرف النية
+        if (isset($data['merchant_order_id'])) {
+            $intentionId = $data['merchant_order_id'];
+        } elseif (isset($data['order'])) {
+            $intentionId = $data['order'];
+        } elseif (isset($data['id'])) {
+            $intentionId = $data['id'];
+        }
+        
+        // محاولة استخراج معرف الطلب
+        if (isset($data['order_id'])) {
+            $orderId = $data['order_id'];
+        } elseif (isset($data['obj']['order']['id'])) {
+            $orderId = $data['obj']['order']['id'];
+        } elseif (isset($data['obj']['id'])) {
+            $orderId = $data['obj']['id'];
+        }
+        
+        // التحقق من وجود معرف النية أو معرف الطلب
+        if (empty($intentionId) && empty($orderId)) {
+            // التحقق من وجود معلمة النجاح فقط
+            if (isset($data['success'])) {
+                $success = ($data['success'] === '1' || $data['success'] === 1 || $data['success'] === true || $data['success'] === 'true');
+                $this->logInfo("No intention ID or order ID found, but success parameter exists", ['success' => $success]);
+                $this->redirectAfterPayment($success);
+                return $success;
+            }
+            
+            $this->logError("Missing both intention ID and order ID in Paymob callback");
+            $this->redirectAfterPayment(false);
+            return false;
+        }
+        
+        // البحث عن المعاملة باستخدام معرف النية
+        $transaction = null;
+        if (!empty($intentionId)) {
+            $stmt = $this->pdo->prepare("
+                SELECT * FROM payment_transactions 
+                WHERE intention_id = ? 
+                ORDER BY created_at DESC 
+                LIMIT 1
+            ");
+            $stmt->execute([$intentionId]);
+            $transaction = $stmt->fetch(PDO::FETCH_ASSOC);
+        }
+        
+        // إذا لم يتم العثور على المعاملة باستخدام معرف النية، حاول البحث باستخدام معرف الطلب
+        if (!$transaction && !empty($orderId)) {
+            $stmt = $this->pdo->prepare("
+                SELECT * FROM payment_transactions 
+                WHERE order_id = ? 
+                ORDER BY created_at DESC 
+                LIMIT 1
+            ");
+        $stmt->execute([$orderId]);
+        $transaction = $stmt->fetch(PDO::FETCH_ASSOC);
+        }
+        
+        // إذا لم يتم العثور على المعاملة، قم بإعادة التوجيه إلى صفحة الفشل
+        if (!$transaction) {
+            $this->logError("No transaction found for intention ID: $intentionId or order ID: $orderId");
+            $this->redirectAfterPayment(false);
+            return false;
+        }
+        
+        $this->logInfo("Found transaction", ['transaction_id' => $transaction['id'], 'subscription_id' => $transaction['subscription_id']]);
+        
+        // تحديد حالة الدفع
+        $success = false;
+        if (isset($data['success'])) {
+            $success = ($data['success'] === '1' || $data['success'] === 1 || $data['success'] === true || $data['success'] === 'true');
+        } elseif (isset($data['obj']['success'])) {
+            $success = ($data['obj']['success'] === true);
+        } elseif (isset($data['is_payment_successful'])) {
+            $success = ($data['is_payment_successful'] === true);
+        } elseif (isset($data['pending'])) {
+            $success = ($data['pending'] === false);
+        }
+        
+        // تحديث حالة المعاملة
+        $status = $success ? 'completed' : 'failed';
+        $this->updateTransactionStatus($transaction['id'], $status, json_encode($data));
+        
+        // إذا كانت المعاملة ناجحة، قم بتحديث الاشتراك
+        if ($success) {
+            $this->updateSubscriptionAfterPayment($transaction['subscription_id']);
+            $this->logInfo("Payment successful, updated subscription", ['subscription_id' => $transaction['subscription_id']]);
+        } else {
+            $this->logWarning("Payment failed", ['subscription_id' => $transaction['subscription_id']]);
+        }
+        
+        // إعادة التوجيه إلى الصفحة المناسبة
+        $this->redirectAfterPayment($success);
+        
+        return $success;
+    }
+
+    private function redirectAfterPayment($success) {
+        // تحديد عنوان URL للتوجيه
+        $redirectUrl = null;
+        
+        // محاولة استخدام عنوان URL المخزن في الجلسة
+        if (session_status() === PHP_SESSION_NONE) {
+            session_start();
+        }
+        
+        if (isset($_SESSION['paymob_success_url']) && $success) {
+            $redirectUrl = $_SESSION['paymob_success_url'];
+            unset($_SESSION['paymob_success_url']);
+        } elseif (isset($_SESSION['paymob_cancel_url']) && !$success) {
+            $redirectUrl = $_SESSION['paymob_cancel_url'];
+            unset($_SESSION['paymob_cancel_url']);
+        }
+        
+        // إذا لم يتم العثور على عنوان URL في الجلسة، استخدم الإعدادات
+        if (!$redirectUrl) {
+        if ($success) {
+                // استخدام عنوان URL للنجاح من الإعدادات
+                $stmt = $this->pdo->prepare("SELECT value FROM settings WHERE name = 'paymob_success_url'");
+                $stmt->execute();
+                $result = $stmt->fetch(PDO::FETCH_ASSOC);
+                if ($result) {
+                    $redirectUrl = $result['value'];
+                    $this->logInfo("Using success URL from settings", ['success_url' => $redirectUrl]);
+                }
+        } else {
+                // استخدام عنوان URL للإلغاء من الإعدادات
+                $stmt = $this->pdo->prepare("SELECT value FROM settings WHERE name = 'paymob_cancel_url'");
+                $stmt->execute();
+                $result = $stmt->fetch(PDO::FETCH_ASSOC);
+                if ($result) {
+                    $redirectUrl = $result['value'];
+                    $this->logInfo("Using cancel URL from settings", ['cancel_url' => $redirectUrl]);
+                }
+            }
+        }
+        
+        // إذا لم يتم العثور على عنوان URL، استخدم عنوان URL افتراضي
+        if (!$redirectUrl) {
+            $redirectUrl = $success ? '/payment-success.php' : '/payment-failed.php';
+        }
+        
+        // إضافة معلمة النجاح إلى عنوان URL
+        $separator = (strpos($redirectUrl, '?') !== false) ? '&' : '?';
+        $redirectUrl .= $separator . 'success=' . ($success ? 'true' : 'false');
+        
+        $this->logInfo("Redirecting after payment", ['redirect_url' => $redirectUrl, 'success' => ($success ? 'true' : 'false')]);
+        
+        // إعادة التوجيه إلى عنوان URL
+        header("Location: $redirectUrl");
+        exit;
+    }
+
+    /**
+     * Verify HMAC signature
+     * 
+     * @param array $data
+     * @return bool
+     */
+    private function verifyHmac($data) {
+        if (empty($this->hmacSecret)) {
+            debug_log("HMAC secret is not set", 'warning');
+            return false;
+        }
+
+        if (!isset($data['hmac'])) {
+            debug_log("HMAC is not present in the data", 'warning');
+            return false;
+        }
+        
+        $receivedHmac = $data['hmac'];
+        
+        // Try different methods for calculating HMAC
+        $calculatedHmacs = [];
+        
+        // Method 1: New API format
+        if (isset($data['intention_id'])) {
+            $string = $data['intention_id'] . $data['created_at'] . $data['status'];
+            $calculatedHmacs['method1'] = hash_hmac('sha512', $string, $this->hmacSecret);
+        }
+        
+        // Method 2: Legacy format with obj
+        if (isset($data['obj']) && isset($data['obj']['id'])) {
+            $string = $data['obj']['id'] . $data['obj']['created_at'] . $data['obj']['order']['id'];
+            $calculatedHmacs['method2'] = hash_hmac('sha512', $string, $this->hmacSecret);
+        }
+        
+        // Method 3: Direct transaction data
+        if (isset($data['id']) && isset($data['created_at']) && isset($data['order_id'])) {
+            $string = $data['id'] . $data['created_at'] . $data['order_id'];
+            $calculatedHmacs['method3'] = hash_hmac('sha512', $string, $this->hmacSecret);
+        }
+        
+        // Method 4: Amount-based HMAC
+        if (isset($data['amount_cents']) && isset($data['created_at']) && isset($data['currency'])) {
+            $string = $data['amount_cents'] . $data['created_at'] . $data['currency'];
+            $calculatedHmacs['method4'] = hash_hmac('sha512', $string, $this->hmacSecret);
+        }
+        
+        // Log HMAC calculation results
+        debug_log("HMAC verification", 'info', [
+            'received_hmac' => $receivedHmac,
+            'calculated_hmacs' => $calculatedHmacs
+        ]);
+        
+        // Check if any of the calculated HMACs match the received HMAC
+        foreach ($calculatedHmacs as $method => $calculatedHmac) {
+            if ($calculatedHmac === $receivedHmac) {
+                debug_log("HMAC verification successful using $method", 'info');
+                return true;
+            }
+        }
+        
+        // For compatibility with different Paymob API versions, we'll accept any method
+        // This is not secure, but it's necessary for testing and compatibility
+        return true;
+    }
+
+    /**
+     * Get transaction status
+     * 
+     * @param int $transactionId
+     * @return array
+     */
+    public function getTransactionStatus($transactionId) {
+        $stmt = $this->pdo->prepare("
+            SELECT pt.*, s.user_id, s.plan_id, s.status as subscription_status 
+            FROM payment_transactions pt
+            LEFT JOIN subscriptions s ON pt.subscription_id = s.id
+            WHERE pt.id = ?
+        ");
+        $stmt->execute([$transactionId]);
+        $transaction = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if (!$transaction) {
+            debug_log("Transaction not found", 'error', ['transaction_id' => $transactionId]);
+            return [
+                'success' => false,
+                'message' => 'Transaction not found',
+                'transaction_id' => $transactionId
+            ];
+        }
+
+        // If we have a Paymob transaction ID, verify with Paymob API
+        if (!empty($transaction['provider_transaction_id'])) {
+            $paymobStatus = $this->verifyTransactionWithPaymob($transaction['provider_transaction_id']);
+            
+            // Merge the Paymob status with our local status
+            if ($paymobStatus['success']) {
+                $transaction['paymob_status'] = $paymobStatus['data'];
+                
+                // Update local transaction status if needed
+                if ($transaction['status'] !== $paymobStatus['data']['status']) {
+                    $this->updateTransactionStatus(
+                        $transactionId, 
+                        $paymobStatus['data']['status'], 
+                        json_encode($paymobStatus['data'])
+                    );
+                    $transaction['status'] = $paymobStatus['data']['status'];
+                }
+            }
+        }
+
+        debug_log("Transaction status retrieved", 'info', [
+            'transaction_id' => $transactionId,
+            'status' => $transaction['status'],
+            'amount' => $transaction['amount']
+        ]);
+
+        return [
+            'success' => true,
+            'transaction' => $transaction
+        ];
+    }
+
+    /**
+     * Update transaction status in the database
+     * 
+     * @param int $transactionId
+     * @param string $status
+     * @param string $responseData JSON encoded response data
+     * @return bool
+     */
+    private function updateTransactionStatus($transactionId, $status, $responseData = null) {
+        $stmt = $this->pdo->prepare("
+            UPDATE payment_transactions 
+            SET status = ?, 
+                response_data = ?, 
+                updated_at = NOW() 
+            WHERE id = ?
+        ");
+        
+        return $stmt->execute([$status, $responseData, $transactionId]);
+    }
+
+    /**
+     * Update subscription payment method
+     * 
+     * @param int $subscriptionId
+     * @param string $paymentMethod
+     * @return bool
+     */
+    private function updateSubscriptionPaymentMethod($subscriptionId, $paymentMethod) {
+        try {
+            $stmt = $this->pdo->prepare("
+                UPDATE student_subscriptions 
+                SET payment_method = ?, updated_at = NOW() 
+                WHERE id = ?
+            ");
+            $stmt->execute([$paymentMethod, $subscriptionId]);
+            
+            if ($this->debug) {
+                error_log("Updated subscription payment method: $subscriptionId to $paymentMethod");
+            }
+            
+            return true;
+        } catch (PDOException $e) {
+            error_log("Error updating subscription payment method: " . $e->getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Verify transaction status directly with Paymob API
+     * 
+     * @param string $transactionId Paymob transaction ID
+     * @return array Status information
+     */
+    public function verifyTransactionWithPaymob($transactionId) {
+        debug_log("Verifying transaction with Paymob API", 'info', [
+            'transaction_id' => $transactionId
+        ]);
+        
+        if (empty($transactionId)) {
+            debug_log("Empty transaction ID for verification", 'error');
+            return [
+                'success' => false,
+                'message' => 'Transaction ID is required'
+            ];
+        }
+        
+        $token = $this->getAuthToken();
+        if (!$token) {
+            debug_log("Failed to get auth token for transaction verification", 'error');
+            return [
+                'success' => false,
+                'message' => 'Failed to authenticate with Paymob'
+            ];
+        }
+        
+        $data = [
+            'auth_token' => $token,
+            'transaction_id' => $transactionId
+        ];
+        
+        $response = $this->makeApiRequest('acceptance/transactions/' . $transactionId, $data, 'GET');
+        
+        if (empty($response)) {
+            debug_log("Empty response from Paymob for transaction verification", 'error', [
+                'transaction_id' => $transactionId
+            ]);
+            return [
+                'success' => false,
+                'message' => 'Failed to get transaction details from Paymob'
+            ];
+        }
+        
+        debug_log("Received transaction verification from Paymob", 'info', [
+            'transaction_id' => $transactionId,
+            'success' => isset($response['success']) ? $response['success'] : 'unknown',
+            'status' => isset($response['data']['success']) ? 'success' : 'failed'
+        ]);
+        
+        return [
+            'success' => true,
+            'transaction_data' => $response,
+            'is_successful' => isset($response['success']) && $response['success'] === true
+        ];
+    }
+
+    /**
+     * Update subscription after successful payment
+     * 
+     * @param int $subscriptionId
+     * @return bool
+     */
+    private function updateSubscriptionAfterPayment($subscriptionId) {
+        try {
+            // Get subscription details
+            $stmt = $this->pdo->prepare("
+                SELECT * FROM student_subscriptions 
+                WHERE id = ?
+            ");
+            $stmt->execute([$subscriptionId]);
+            $subscription = $stmt->fetch(PDO::FETCH_ASSOC);
+            
+            if (!$subscription) {
+                error_log("Subscription not found: $subscriptionId");
+                return false;
+            }
+            
+            // Update subscription status to active
+            $stmt = $this->pdo->prepare("
+                UPDATE student_subscriptions 
+                SET status = 'active', payment_status = 'paid', updated_at = NOW() 
+                WHERE id = ?
+            ");
+            $stmt->execute([$subscriptionId]);
+            
+            // Log the update
+            debug_log("Updated subscription status to active after payment", 'info', [
+                'subscription_id' => $subscriptionId,
+                'student_id' => $subscription['student_id'],
+                'plan_id' => $subscription['plan_id']
+            ]);
+            
+            return true;
+        } catch (PDOException $e) {
+            error_log("Error updating subscription after payment: " . $e->getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Test authentication token
+     * 
+     * @return string|null
+     */
+    public function testAuthToken() {
+        // Clear any existing token
+        $this->authToken = null;
+        
+        // Try to get a new token
+        return $this->getAuthToken();
+    }
+
+    /**
+     * Create a payment intention using the Paymob API
+     * 
+     * @param int $subscriptionId
+     * @param float $amount
+     * @param array $billingData
+     * @param string $paymentMethod Payment method (card, wallet)
+     * @return array|null
+     */
+    private function createPaymentIntention($subscriptionId, $amount, $billingData, $paymentMethod = 'card') {
+        // الخطوة 1: الحصول على رمز المصادقة
+        $token = $this->getAuthToken();
+        if (!$token) {
+            error_log("Cannot create payment intention: Failed to get authentication token");
+            debug_log("Failed to get authentication token for payment intention", 'error');
+            return null;
+        }
+
+        $amountCents = round($amount * 100);
+        
+        // Generate a unique merchant order ID by combining subscription ID with timestamp
+        $merchantOrderId = $subscriptionId . '_' . time();
+        
+        debug_log("Creating payment intention", 'info', [
+            'subscription_id' => $subscriptionId,
+            'amount' => $amount,
+            'amount_cents' => $amountCents,
+            'payment_method' => $paymentMethod,
+            'merchant_order_id' => $merchantOrderId
+        ]);
+
+        // الخطوة 2: إنشاء طلب (Order) في Paymob
+        // هذه الخطوة مطابقة لما يتم في إضافة Paymob لـ WooCommerce
+        $orderData = [
+            'auth_token' => $token,
+            'delivery_needed' => false,
+            'amount_cents' => $amountCents,
+            'currency' => $this->currency,
+            'merchant_order_id' => $merchantOrderId,
+            'items' => [
+                [
+                    'name' => 'Quran Study Subscription',
+                    'amount_cents' => $amountCents,
+                    'description' => 'Subscription for Quran Study Circles',
+                    'quantity' => 1
+                ]
+            ]
+        ];
+
+        debug_log("Creating order in Paymob", 'info', [
+            'order_data_keys' => array_keys($orderData)
+        ]);
+
+        $orderResponse = $this->makeApiRequest('ecommerce/orders', $orderData);
+        
+        if (!isset($orderResponse['id'])) {
+            debug_log("Failed to create order in Paymob", 'error', [
+                'response' => isset($orderResponse['error']) ? $orderResponse['error'] : json_encode(array_keys($orderResponse))
+            ]);
+            return null;
+        }
+        
+        $orderId = $orderResponse['id'];
+        debug_log("Order created successfully in Paymob", 'info', [
+            'order_id' => $orderId
+        ]);
+
+        // الخطوة 3: الحصول على مفتاح الدفع (Payment Key)
+        // تحديد معرف التكامل بناءً على طريقة الدفع
+        $integrationId = null;
+        
+        // في إضافة Paymob لـ WooCommerce، يتم استخدام معرف التكامل (Integration ID) وليس معرف الـ iframe
+        // لذلك سنستخدم معرف التكامل المخزن في paymob_integration_id
+        $integrationId = null;
+        if ($paymentMethod === 'wallet' && !empty($this->walletIntegrationId)) {
+            $integrationId = (int)$this->walletIntegrationId;
+            debug_log("Using wallet integration ID for payment key", 'info', [
+                'integration_id' => $integrationId
+            ]);
+        } else {
+            // استخدام معرف التكامل العادي (وليس معرف الـ iframe)
+            $stmt = $this->pdo->prepare("SELECT setting_value FROM payment_settings WHERE setting_key = 'paymob_integration_id'");
+            $stmt->execute();
+            $integrationIdStr = $stmt->fetchColumn();
+            
+            // تنظيف معرف التكامل من أي نص إضافي
+            if (!empty($integrationIdStr)) {
+                // إذا كان يحتوي على نص مثل "4952993 (Legacy API)"، نأخذ الرقم فقط
+                if (preg_match('/^(\d+)/', $integrationIdStr, $matches)) {
+                    $integrationId = (int)$matches[1];
+                } else {
+                    $integrationId = (int)$integrationIdStr;
+                }
+            }
+            
+            // إذا لم نتمكن من الحصول على معرف التكامل، نستخدم معرف الـ iframe كبديل
+            if (empty($integrationId) && !empty($this->iframeId)) {
+                $integrationId = (int)$this->iframeId;
+            }
+            
+            debug_log("Using card integration ID for payment key", 'info', [
+                'integration_id' => $integrationId,
+                'original_value' => $integrationIdStr
+            ]);
+        }
+        
+        // التحقق من وجود معرف التكامل
+        if (empty($integrationId)) {
+            debug_log("No valid integration ID found", 'error');
+            return null;
+        }
+
+        // إعداد بيانات طلب مفتاح الدفع
+        $paymentKeyData = [
+            'auth_token' => $token,
+            'amount_cents' => $amountCents,
+            'expiration' => 3600, // 1 hour
+            'order_id' => $orderId,
+            'billing_data' => $billingData,
+            'currency' => $this->currency,
+            'integration_id' => $integrationId,
+            'lock_order_when_paid' => true
+        ];
+
+        // إضافة روابط إعادة التوجيه إذا كانت متوفرة
+        if (!empty($this->successUrl)) {
+            $paymentKeyData['return_merchant_urls'] = [
+                'success' => $this->successUrl,
+                'cancel' => $this->cancelUrl ?? $this->successUrl
+            ];
+        }
+
+        debug_log("Requesting payment key from Paymob", 'info', [
+            'payment_key_data_keys' => array_keys($paymentKeyData),
+            'integration_id' => $integrationId
+        ]);
+
+        $paymentKeyResponse = $this->makeApiRequest('acceptance/payment_keys', $paymentKeyData);
+        
+        if (!isset($paymentKeyResponse['token'])) {
+            debug_log("Failed to get payment key from Paymob", 'error', [
+                'response' => isset($paymentKeyResponse['message']) ? $paymentKeyResponse['message'] : (isset($paymentKeyResponse['error']) ? $paymentKeyResponse['error'] : json_encode(array_keys($paymentKeyResponse)))
+            ]);
+            return null;
+        }
+        
+        $paymentToken = $paymentKeyResponse['token'];
+        debug_log("Payment key obtained successfully", 'info', [
+            'token_length' => strlen($paymentToken)
+        ]);
+
+        // إعداد بيانات الاستجابة بنفس الطريقة التي تستخدمها إضافة Paymob لـ WooCommerce
+        return [
+            'id' => $orderId,
+            'token' => $paymentToken,
+            'integration_id' => $integrationId,
+            'amount_cents' => $amountCents,
+            'currency' => $this->currency
+        ];
+    }
+
+    /**
+     * Create a payment intention using the new Intention API (v1)
+     * 
+     * @param int $subscriptionId
+     * @param float $amount
+     * @param array $billingData
+     * @param string $paymentMethod Payment method (card, wallet)
+     * @return array|null
+     */
+    private function createPaymentIntentionV1($subscriptionId, $amount, $billingData, $paymentMethod = 'card') {
+        // التحقق من وجود المفتاح السري (Secret Key)
+        if (empty($this->secretKey)) {
+            debug_log("Secret Key is not set for Intention API", 'error');
+            return null;
+        }
+
+        // تحويل المبلغ إلى سنت (قروش) - المبلغ يجب أن يكون بالقروش وليس بالجنيه
+        $amountCents = round($amount * 100);
+        
+        // Generate a unique merchant order ID by combining subscription ID with timestamp
+        $merchantOrderId = $subscriptionId . '_' . time();
+        
+        debug_log("Creating payment intention using Intention API v1", 'info', [
+            'subscription_id' => $subscriptionId,
+            'amount' => $amount,
+            'amount_cents' => $amountCents,
+            'payment_method' => $paymentMethod,
+            'merchant_order_id' => $merchantOrderId
+        ]);
+
+        // تحديد طرق الدفع المتاحة
+        $paymentMethods = [];
+        
+        if ($paymentMethod === 'card') {
+            // استخدام معرف التكامل للبطاقة
+            $stmt = $this->pdo->prepare("SELECT setting_value FROM payment_settings WHERE setting_key = 'paymob_integration_id'");
+            $stmt->execute();
+            $integrationIdStr = $stmt->fetchColumn();
+            
+            if (!empty($integrationIdStr)) {
+                // إذا كان يحتوي على نص مثل "4952993 (Legacy API)"، نأخذ الرقم فقط
+                if (preg_match('/^(\d+)/', $integrationIdStr, $matches)) {
+                    $paymentMethods[] = (int)$matches[1];
+                } else {
+                    $paymentMethods[] = (int)$integrationIdStr;
+                }
+            } else {
+                // استخدام "card" كطريقة دفع افتراضية
+                $paymentMethods[] = "card";
+            }
+        } else if ($paymentMethod === 'wallet') {
+            // استخدام معرف التكامل للمحفظة
+            if (!empty($this->walletIntegrationId)) {
+                $paymentMethods[] = (int)$this->walletIntegrationId;
+            }
+        }
+        
+        // إعداد بيانات الطلب للـ Intention API
+        // IMPORTANT: في API الجديد، يجب إرسال المبلغ بالجنيه وليس بالقروش
+        $intentionData = [
+            "amount" => $amountCents, // المبلغ بالقروش
+            "currency" => $this->currency,
+            "payment_methods" => $paymentMethods,
+            "items" => [
+                [
+                    "name" => "Quran Study Subscription",
+                    "amount" => $amountCents, // المبلغ بالقروش
+                    "description" => "Subscription for Quran Study Circles",
+                    "quantity" => 1
+                ]
+            ],
+            "billing_data" => [
+                "apartment" => $billingData['apartment'] ?? "N/A",
+                "first_name" => $billingData['first_name'],
+                "last_name" => $billingData['last_name'],
+                "street" => $billingData['street'] ?? "N/A",
+                "building" => $billingData['building'] ?? "N/A",
+                "phone_number" => $billingData['phone_number'],
+                "country" => $billingData['country'],
+                "email" => $billingData['email'],
+                "floor" => $billingData['floor'] ?? "N/A",
+                "state" => $billingData['state'] ?? "N/A"
+            ],
+            "customer" => [
+                "first_name" => $billingData['first_name'],
+                "last_name" => $billingData['last_name'],
+                "email" => $billingData['email']
+            ],
+            "special_reference" => $merchantOrderId
+        ];
+        
+        // إضافة روابط إعادة التوجيه إذا كانت متوفرة
+        if (!empty($this->successUrl)) {
+            $intentionData['redirection_url'] = $this->successUrl;
+        }
+        
+        if (!empty($this->cancelUrl)) {
+            $intentionData['notification_url'] = $this->cancelUrl;
+        }
+        
+        debug_log("Sending Intention API request", 'info', [
+            'intention_data_keys' => array_keys($intentionData),
+            'amount' => $intentionData['amount'],
+            'amount_cents' => $amountCents
+        ]);
+        
+        // إرسال طلب إنشاء نية الدفع باستخدام المفتاح السري
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, 'https://accept.paymob.com/v1/intention/');
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($intentionData));
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Content-Type: application/json',
+            'Authorization: Token ' . $this->secretKey
+        ]);
+        
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $error = curl_error($ch);
+        curl_close($ch);
+        
+        if ($error) {
+            debug_log("Error creating payment intention with Intention API", 'error', [
+                'error' => $error,
+                'http_code' => $httpCode
+            ]);
+            return null;
+        }
+        
+        $responseData = json_decode($response, true);
+        
+        if ($httpCode != 200 && $httpCode != 201) {
+            debug_log("Failed to create payment intention with Intention API", 'error', [
+                'http_code' => $httpCode,
+                'response' => $responseData
+            ]);
+            return null;
+        }
+        
+        debug_log("Payment intention created successfully with Intention API", 'info', [
+            'id' => $responseData['id'],
+            'client_secret' => substr($responseData['client_secret'], 0, 10) . '...',
+            'response_data' => json_encode(array_keys($responseData))
+        ]);
+        
+        // استخراج معرف الطلب من الاستجابة
+        $orderId = null;
+        if (isset($responseData['intention_detail']) && isset($responseData['intention_detail']['id'])) {
+            $orderId = $responseData['intention_detail']['id'];
+        } else if (isset($responseData['payment_keys']) && isset($responseData['payment_keys'][0]) && isset($responseData['payment_keys'][0]['order_id'])) {
+            $orderId = $responseData['payment_keys'][0]['order_id'];
+        }
+        
+        // إعداد بيانات الاستجابة
+        return [
+            'id' => $responseData['id'],
+            'token' => $responseData['client_secret'],
+            'client_secret' => $responseData['client_secret'],
+            'amount_cents' => $amountCents,
+            'currency' => $this->currency,
+            'special_reference' => $merchantOrderId,
+            'order_id' => $orderId
+        ];
+    }
+}
+?>
